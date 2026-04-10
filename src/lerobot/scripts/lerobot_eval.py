@@ -159,6 +159,7 @@ def rollout(
         desc=f"Running rollout with at most {max_steps} steps",
         disable=inside_slurm(),  # we dont want progress bar when we use slurm, since it clutters the logs
         leave=False,
+        dynamic_ncols=True,
     )
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
@@ -334,7 +335,7 @@ def eval_policy(
         episode_data: dict | None = None
 
     # we dont want progress bar when we use slurm, since it clutters the logs
-    progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
+    progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm(), dynamic_ncols=True)
     for batch_ix in progbar:
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
         # step.
