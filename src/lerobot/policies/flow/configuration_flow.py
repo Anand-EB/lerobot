@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamConfig
-# from lerobot.optim.schedulers import DiffuserSchedulerConfig
+from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 
 @PreTrainedConfig.register_subclass("flow")
@@ -81,20 +81,12 @@ class FlowConfig(PreTrainedConfig):
         use_film_scale_modulation: FiLM (https://huggingface.co/papers/1709.07871) is used for the Unet conditioning.
             Bias modulation is used be default, while this parameter indicates whether to also use scale
             modulation.
-        noise_scheduler_type: Name of the noise scheduler to use. Supported options: ["DDPM", "DDIM"].
-        num_train_timesteps: Number of diffusion steps for the forward diffusion schedule.
-        beta_schedule: Name of the diffusion beta schedule as per DDPMScheduler from Hugging Face diffusers.
-        beta_start: Beta value for the first forward-diffusion step.
-        beta_end: Beta value for the last forward-diffusion step.
-        prediction_type: The type of prediction that the diffusion modeling Unet makes. Choose from "epsilon"
-            or "sample". These have equivalent outcomes from a latent variable modeling perspective, but
-            "epsilon" has been shown to work better in many deep neural network settings.
-        clip_sample: Whether to clip the sample to [-`clip_sample_range`, +`clip_sample_range`] for each
-            denoising step at inference time. WARNING: you will need to make sure your action-space is
-            normalized to fit within this range.
-        clip_sample_range: The magnitude of the clipping range as described above.
-        num_inference_steps: Number of reverse diffusion steps to use at inference time (steps are evenly
-            spaced). If not provided, this defaults to be the same as `num_train_timesteps`.
+        down_dims: Feature dimension for each stage of temporal downsampling in the UNet.
+        num_inference_steps: Number of ODE integration steps at inference time. If not provided,
+            defaults to `num_train_timesteps`.
+        num_train_timesteps: Fallback value for `num_inference_steps` when the latter is None.
+        ode_method: ODE solver method passed to `flow_matching.solver.ODESolver`. Supported values:
+            "euler", "midpoint", "rk4". Euler is the fastest; rk4 is more accurate at larger step sizes.
         do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
             `LeRobotDataset` and `load_previous_and_future_frames` for more information. Note, this defaults
             to False as the original Flow Policy implementation does the same.
@@ -134,18 +126,10 @@ class FlowConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
-    # Noise scheduler.
-    # noise_scheduler_type: str = "DDPM"
+    # Flow matching scheduler.
     num_train_timesteps: int = 100
-    # beta_schedule: str = "squaredcos_cap_v2"
-    # beta_start: float = 0.0001
-    # beta_end: float = 0.02
-    # prediction_type: str = "epsilon"
-    # clip_sample: bool = True
-    clip_sample_range: float = 1.0
-
-    # Inference
     num_inference_steps: int | None = None
+    ode_method: str = "euler"
 
     # Optimization
     compile_model: bool = False
@@ -169,18 +153,6 @@ class FlowConfig(PreTrainedConfig):
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
-            )
-
-        supported_prediction_types = ["epsilon", "sample"]
-        if self.prediction_type not in supported_prediction_types:
-            raise ValueError(
-                f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
-            )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
-        if self.noise_scheduler_type not in supported_noise_schedulers:
-            raise ValueError(
-                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
-                f"Got {self.noise_scheduler_type}."
             )
 
         if self.resize_shape is not None and (

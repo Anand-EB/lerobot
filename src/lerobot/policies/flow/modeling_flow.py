@@ -14,11 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
-
-TODO(alexander-soare):
-  - Remove reliance on diffusers for DDPMScheduler and LR scheduler.
-"""
+"""Flow Matching Policy using Conditional Optimal Transport path and Euler ODE solver."""
 
 import math
 from collections import deque
@@ -29,11 +25,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from flow_matching.path import CondOTProbPath
+from flow_matching.solver import ODESolver
 from torch import Tensor, nn
 
-from lerobot.src.lerobot.policies.flow.configuration_flow import FlowConfig
+from lerobot.policies.flow.configuration_flow import FlowConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -150,18 +146,6 @@ class FlowPolicy(PreTrainedPolicy):
         return loss, None
 
 
-def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
-    """
-    Factory for noise scheduler instances of the requested type. All kwargs are passed
-    to the scheduler.
-    """
-    if name == "DDPM":
-        return DDPMScheduler(**kwargs)
-    elif name == "DDIM":
-        return DDIMScheduler(**kwargs)
-    else:
-        raise ValueError(f"Unsupported noise scheduler type {name}")
-
 
 class FlowModel(nn.Module):
     def __init__(self, config: FlowConfig):
@@ -189,21 +173,10 @@ class FlowModel(nn.Module):
             # common in diffusion inference.
             self.unet = torch.compile(self.unet, mode=config.compile_mode)
 
-        self.noise_scheduler = _make_noise_scheduler(
-            config.noise_scheduler_type,
-            num_train_timesteps=config.num_train_timesteps,
-            beta_start=config.beta_start,
-            beta_end=config.beta_end,
-            beta_schedule=config.beta_schedule,
-            clip_sample=config.clip_sample,
-            clip_sample_range=config.clip_sample_range,
-            prediction_type=config.prediction_type,
+        self.path = CondOTProbPath()
+        self.num_inference_steps = (
+            config.num_inference_steps if config.num_inference_steps is not None else config.num_train_timesteps
         )
-
-        if config.num_inference_steps is None:
-            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
-        else:
-            self.num_inference_steps = config.num_inference_steps
 
     # ========= inference  ============
     def conditional_sample(
@@ -228,17 +201,19 @@ class FlowModel(nn.Module):
             )
         )
 
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
+        # ODE integration from t=0 (noise) to t=1 (data) using Euler solver.
+        def velocity_model(x: Tensor, t: Tensor, **kwargs) -> Tensor:
+            # ODESolver passes t as a scalar; expand to (B,) for the UNet.
+            return self.unet(x, t.expand(x.shape[0]), global_cond=global_cond)
 
-        for t in self.noise_scheduler.timesteps:
-            # Predict model output.
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
-            # Compute previous image: x_t -> x_t-1
-            sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
+        solver = ODESolver(velocity_model=velocity_model)
+        sample = solver.sample(
+            x_init=sample,
+            step_size=1.0 / self.num_inference_steps,
+            method=self.config.ode_method,
+            time_grid=torch.tensor([0.0, 1.0], dtype=sample.dtype, device=sample.device),
+            verbose=False,
+        )
 
         return sample
 
@@ -332,33 +307,20 @@ class FlowModel(nn.Module):
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
-        # Forward Flow.
+        # Forward Flow (Conditional OT).
         trajectory = batch[ACTION]
-        # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+        # x_0 ~ N(0, I), x_1 = clean trajectory.
+        x_0 = torch.randn(trajectory.shape, device=trajectory.device, dtype=trajectory.dtype)
+        # t ~ Uniform(0, 1) per sample in batch.
+        t = torch.rand(trajectory.shape[0], device=trajectory.device, dtype=trajectory.dtype)
+        # x_t = (1-t)*x_0 + t*x_1, ut = x_1 - x_0 (conditional vector field).
+        path_sample = self.path.sample(x_0, trajectory, t)
+        x_t, ut = path_sample.x_t, path_sample.dx_t
 
-        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        # Predict the vector field.
+        pred = self.unet(x_t, t, global_cond=global_cond)
 
-        # Compute the loss.
-        # The target is either the original trajectory, or the noise.
-        if self.config.prediction_type == "epsilon":
-            target = eps
-        elif self.config.prediction_type == "sample":
-            target = batch[ACTION]
-        else:
-            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
-
-        loss = F.mse_loss(pred, target, reduction="none")
+        loss = F.mse_loss(pred, ut, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
