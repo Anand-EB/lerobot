@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
+import logging
 from collections import deque
 from collections.abc import Callable
 
@@ -26,27 +26,30 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
+from transformers import AutoProcessor
 
+from lerobot.policies.fastbet.configuration_fastbet import FASTBeTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import get_device_from_parameters, get_output_shape, populate_queues
-from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
-from lerobot.policies.vqbet.vqbet_utils import GPT, ResidualVQ
+from lerobot.policies.utils import get_output_shape, populate_queues
+from lerobot.policies.vqbet.vqbet_utils import GPT
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 # ruff: noqa: N806
 
+logger = logging.getLogger(__name__)
 
-class VQBeTPolicy(PreTrainedPolicy):
+
+class FASTBeTPolicy(PreTrainedPolicy):
     """
     VQ-BeT Policy as per "Behavior Generation with Latent Actions"
     """
 
-    config_class = VQBeTConfig
-    name = "vqbet"
+    config_class = FASTBeTConfig
+    name = "fastbet"
 
     def __init__(
         self,
-        config: VQBeTConfig | None = None,
+        config: FASTBeTConfig | None = None,
         **kwargs,
     ):
         """
@@ -60,16 +63,12 @@ class VQBeTPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        self.vqbet = VQBeTModel(config)
+        tokenizer = AutoProcessor.from_pretrained(config.fast_tokenizer_name, trust_remote_code=True)
+        self.vqbet = FASTBeTModel(config, tokenizer)
 
         self.reset()
 
     def get_optim_params(self) -> dict:
-        vqvae_params = (
-            list(self.vqbet.action_head.vqvae_model.encoder.parameters())
-            + list(self.vqbet.action_head.vqvae_model.decoder.parameters())
-            + list(self.vqbet.action_head.vqvae_model.vq_layer.parameters())
-        )
         decay_params, no_decay_params = self.vqbet.policy.configure_parameters()
         decay_params = (
             decay_params
@@ -77,26 +76,12 @@ class VQBeTPolicy(PreTrainedPolicy):
             + list(self.vqbet.state_projector.parameters())
             + list(self.vqbet.rgb_feature_projector.parameters())
             + [self.vqbet.action_token]
-            + list(self.vqbet.action_head.map_to_cbet_preds_offset.parameters())
+            + list(self.vqbet.action_head.lm_head.parameters())
         )
-
-        if self.config.sequentially_select:
-            decay_params = (
-                decay_params
-                + list(self.vqbet.action_head.map_to_cbet_preds_primary_bin.parameters())
-                + list(self.vqbet.action_head.map_to_cbet_preds_secondary_bin.parameters())
-            )
-        else:
-            decay_params = decay_params + list(self.vqbet.action_head.map_to_cbet_preds_bin.parameters())
 
         return [
             {
                 "params": decay_params,
-            },
-            {
-                "params": vqvae_params,
-                "weight_decay": self.config.optimizer_vqvae_weight_decay,
-                "lr": self.config.optimizer_vqvae_lr,
             },
             {
                 "params": no_decay_params,
@@ -141,12 +126,6 @@ class VQBeTPolicy(PreTrainedPolicy):
 
         self._queues = populate_queues(self._queues, batch)
 
-        if not self.vqbet.action_head.vqvae_model.discretized.item():
-            warnings.warn(
-                "To evaluate in the environment, your VQ-BeT model should contain a pretrained Residual VQ.",
-                stacklevel=1,
-            )
-
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch)
             # since the data in the action queue's dimension is (action_chunk_size, batch_size, action_dim), we transpose the action and fill the queue
@@ -159,20 +138,6 @@ class VQBeTPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training or validation."""
         batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
         batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        # VQ-BeT discretizes action using VQ-VAE before training BeT (please refer to section 3.2 in the VQ-BeT paper https://huggingface.co/papers/2403.03181)
-        if not self.vqbet.action_head.vqvae_model.discretized.item():
-            # loss: total loss of training RVQ
-            # n_different_codes: how many of the total possible VQ codes are being used in single batch (how many of them have at least one encoder embedding as a nearest neighbor). This can be at most `vqvae_n_embed * number of layers of RVQ (=2)`.
-            # n_different_combinations: how many different code combinations are being used out of all possible combinations in single batch. This can be at most `vqvae_n_embed ^ number of layers of RVQ (=2)` (hint consider the RVQ as a decision tree).
-            loss, n_different_codes, n_different_combinations, recon_l1_error = (
-                self.vqbet.action_head.discretize(self.config.n_vqvae_training_steps, batch[ACTION])
-            )
-            return loss, {
-                "n_different_codes": n_different_codes,
-                "n_different_combinations": n_different_combinations,
-                "recon_l1_error": recon_l1_error,
-            }
-        # if Residual VQ is already trained, VQ-BeT trains its GPT and bin prediction head / offset prediction head parts.
         _, loss_dict = self.vqbet(batch, rollout=False)
         loss = loss_dict.pop("loss")
 
@@ -250,8 +215,8 @@ class SpatialSoftmax(nn.Module):
         return feature_keypoints
 
 
-class VQBeTModel(nn.Module):
-    """VQ-BeT: The underlying neural network for VQ-BeT
+class FASTBeTModel(nn.Module):
+    """FASTBeT: The underlying neural network for FASTBeT
 
     Note: In this code we use the terms `rgb_encoder`, 'policy', `action_head`. The meanings are as follows.
         - The `rgb_encoder` process rgb-style image observations to one-dimensional embedding vectors
@@ -309,11 +274,11 @@ class VQBeTModel(nn.Module):
                                                       ONLY this chunk is used in rollout!
     """
 
-    def __init__(self, config: VQBeTConfig):
+    def __init__(self, config: FASTBeTConfig, tokenizer):
         super().__init__()
         self.config = config
 
-        self.rgb_encoder = VQBeTRgbEncoder(config)
+        self.rgb_encoder = FASTBeTRgbEncoder(config)
         self.num_images = len(self.config.image_features)
         # This action query token is used as a prompt for querying action chunks. Please refer to "A_Q" in the image above.
         # Note: During the forward pass, this token is repeated as many times as needed. The authors also experimented with initializing the necessary number of tokens independently and observed inferior results.
@@ -327,10 +292,9 @@ class VQBeTModel(nn.Module):
             self.rgb_encoder.feature_dim, hidden_channels=[self.config.gpt_input_dim]
         )
 
-        # GPT part of VQ-BeT
+        # GPT part of FASTBeT
         self.policy = GPT(config)
-        # bin prediction head / offset prediction head part of VQ-BeT
-        self.action_head = VQBeTHead(config)
+        self.action_head = FASTActionHead(config, tokenizer)
 
         # Action tokens for: each observation step, the current action token, and all future action tokens.
         num_tokens = self.config.n_action_pred_token + self.config.n_obs_steps - 1
@@ -388,264 +352,114 @@ class VQBeTModel(nn.Module):
             )
         else:
             features = features[:, historical_act_pred_index]
-        # pass through action head
+        # pass through action head: (B, T, max_action_tokens, vocab_size)
         action_head_output = self.action_head(features)
-        # if rollout, VQ-BeT don't calculate loss
         if rollout:
-            return action_head_output["predicted_action"][:, n_obs_steps - 1, :].reshape(
-                batch_size, self.config.action_chunk_size, -1
-            )
-        # else, it calculate overall loss (bin prediction loss, and offset loss)
+            token_ids = action_head_output[:, n_obs_steps - 1, :, :].argmax(-1)  # (B, max_action_tokens)
+            return self.action_head.decode_actions(token_ids)  # (B, action_chunk_size, action_dim)
         else:
-            output = batch[ACTION][:, self.select_target_actions_indices]
-            loss = self.action_head.loss_fn(action_head_output, output, reduction="mean")
-            return action_head_output, loss
+            target_actions = batch[ACTION][:, self.select_target_actions_indices]
+            loss_dict = self.action_head.loss_fn(action_head_output, target_actions)
+            return action_head_output, loss_dict
 
 
-class VQBeTHead(nn.Module):
-    def __init__(self, config: VQBeTConfig):
-        """
-        VQBeTHead takes output of GPT layers, and pass the feature through bin prediction head (`self.map_to_cbet_preds_bin`), and offset prediction head (`self.map_to_cbet_preds_offset`)
+class FASTActionHead(nn.Module):
+    """Replaces VQBeTHead: predicts FAST token IDs via a linear head + cross-entropy loss.
 
-        self.map_to_cbet_preds_bin: outputs probability of each code (for each layer).
-            The input dimension of `self.map_to_cbet_preds_bin` is same with the output of GPT,
-            and the output dimension of `self.map_to_cbet_preds_bin` is `self.vqvae_model.vqvae_num_layers (=fixed as 2) * self.config.vqvae_n_embed`.
-            if the agent select the code sequentially, we use self.map_to_cbet_preds_primary_bin and self.map_to_cbet_preds_secondary_bin instead of self._map_to_cbet_preds_bin.
+    Training: tokenize ground-truth action chunks with the frozen FAST tokenizer,
+              compute cross-entropy between GPT logits and token IDs.
+    Inference: argmax over logits -> token IDs -> FAST decode -> continuous actions.
+    """
 
-        self.map_to_cbet_preds_offset: output the predicted offsets for all the codes in all the layers.
-            The input dimension of ` self.map_to_cbet_preds_offset` is same with the output of GPT,
-            and the output dimension of ` self.map_to_cbet_preds_offset` is `self.vqvae_model.vqvae_num_layers (=fixed as 2) * self.config.vqvae_n_embed * config.action_chunk_size * config.action_feature.shape[0]`.
-        """
-
+    def __init__(self, config: FASTBeTConfig, tokenizer):
         super().__init__()
         self.config = config
-        # init vqvae
-        self.vqvae_model = VqVae(config)
-        if config.sequentially_select:
-            self.map_to_cbet_preds_primary_bin = MLP(
-                in_channels=config.gpt_output_dim,
-                hidden_channels=[self.config.vqvae_n_embed],
-            )
-            self.map_to_cbet_preds_secondary_bin = MLP(
-                in_channels=config.gpt_output_dim + self.config.vqvae_n_embed,
-                hidden_channels=[self.config.vqvae_n_embed],
-            )
-        else:
-            self.map_to_cbet_preds_bin = MLP(
-                in_channels=config.gpt_output_dim,
-                hidden_channels=[self.vqvae_model.vqvae_num_layers * self.config.vqvae_n_embed],
-            )
-        self.map_to_cbet_preds_offset = MLP(
-            in_channels=config.gpt_output_dim,
-            hidden_channels=[
-                self.vqvae_model.vqvae_num_layers
-                * self.config.vqvae_n_embed
-                * config.action_chunk_size
-                * config.action_feature.shape[0],
-            ],
-        )
-        # loss
-        self._focal_loss_fn = FocalLoss(gamma=2.0)
+        self.tokenizer = tokenizer  # frozen, not a nn.Module
+        self.max_action_tokens = config.max_action_tokens
+        self.vocab_size = config.fast_vocab_size
+        self.action_chunk_size = config.action_chunk_size
+        action_feature = next(iter(config.output_features.values()))
+        self.action_dim = action_feature.shape[-1]
+        self.lm_head = nn.Linear(config.gpt_output_dim, self.max_action_tokens * self.vocab_size)
 
-    def discretize(self, n_vqvae_training_steps, actions):
-        # Resize the action sequence data to fit the action chunk size using a sliding window approach.
-        actions = torch.cat(
-            [
-                actions[:, j : j + self.config.action_chunk_size, :]
-                for j in range(actions.shape[1] + 1 - self.config.action_chunk_size)
-            ],
-            dim=0,
-        )
-        # `actions` is a tensor of shape (new_batch, action_chunk_size, action_dim) where new_batch is the number of possible chunks created from the original sequences using the sliding window.
+    def forward(self, features: Tensor) -> Tensor:
+        # features: (B, T, gpt_output_dim) -> (B, T, max_action_tokens, vocab_size)
+        N, T, _ = features.shape
+        logits = self.lm_head(features)
+        return logits.reshape(N, T, self.max_action_tokens, self.vocab_size)
 
-        loss, metric = self.vqvae_model.vqvae_forward(actions)
-        n_different_codes = sum(
-            [len(torch.unique(metric[2][:, i])) for i in range(self.vqvae_model.vqvae_num_layers)]
-        )
-        n_different_combinations = len(torch.unique(metric[2], dim=0))
-        recon_l1_error = metric[0].detach().cpu().item()
-        self.vqvae_model.optimized_steps += 1
-        # if we updated RVQ more than `n_vqvae_training_steps` steps, we freeze the RVQ part.
-        if self.vqvae_model.optimized_steps >= n_vqvae_training_steps:
-            self.vqvae_model.discretized.fill_(True)
-            self.vqvae_model.vq_layer.freeze_codebook.fill_(True)
-            print("Finished discretizing action data!")
-            self.vqvae_model.eval()
-            for param in self.vqvae_model.vq_layer.parameters():
-                param.requires_grad = False
-        return loss, n_different_codes, n_different_combinations, recon_l1_error
-
-    def forward(self, x, **kwargs) -> dict:
-        # N is the batch size, and T is number of action query tokens, which are process through same GPT
-        N, T, _ = x.shape
-        # we calculate N and T side parallelly. Thus, the dimensions would be
-        # (batch size * number of action query tokens, action chunk size, action dimension)
-        x = einops.rearrange(x, "N T WA -> (N T) WA")
-
-        # sample offsets
-        cbet_offsets = self.map_to_cbet_preds_offset(x)
-        cbet_offsets = einops.rearrange(
-            cbet_offsets,
-            "(NT) (G C WA) -> (NT) G C WA",
-            G=self.vqvae_model.vqvae_num_layers,
-            C=self.config.vqvae_n_embed,
-        )
-        # if self.config.sequentially_select is True, bin prediction head first sample the primary code, and then sample secondary code
-        if self.config.sequentially_select:
-            cbet_primary_logits = self.map_to_cbet_preds_primary_bin(x)
-
-            # select primary bin first
-            cbet_primary_probs = torch.softmax(
-                cbet_primary_logits / self.config.bet_softmax_temperature, dim=-1
-            )
-            NT, choices = cbet_primary_probs.shape
-            sampled_primary_centers = einops.rearrange(
-                torch.multinomial(cbet_primary_probs.view(-1, choices), num_samples=1),
-                "(NT) 1 -> NT",
-                NT=NT,
-            )
-
-            cbet_secondary_logits = self.map_to_cbet_preds_secondary_bin(
-                torch.cat(
-                    (x, F.one_hot(sampled_primary_centers, num_classes=self.config.vqvae_n_embed)),
-                    axis=1,
-                )
-            )
-            cbet_secondary_probs = torch.softmax(
-                cbet_secondary_logits / self.config.bet_softmax_temperature, dim=-1
-            )
-            sampled_secondary_centers = einops.rearrange(
-                torch.multinomial(cbet_secondary_probs.view(-1, choices), num_samples=1),
-                "(NT) 1 -> NT",
-                NT=NT,
-            )
-            sampled_centers = torch.stack((sampled_primary_centers, sampled_secondary_centers), axis=1)
-            cbet_logits = torch.stack([cbet_primary_logits, cbet_secondary_logits], dim=1)
-        # if self.config.sequentially_select is False, bin prediction head samples primary and secondary code at once.
-        else:
-            cbet_logits = self.map_to_cbet_preds_bin(x)
-            cbet_logits = einops.rearrange(
-                cbet_logits, "(NT) (G C) -> (NT) G C", G=self.vqvae_model.vqvae_num_layers
-            )
-            cbet_probs = torch.softmax(cbet_logits / self.config.bet_softmax_temperature, dim=-1)
-            NT, G, choices = cbet_probs.shape
-            sampled_centers = einops.rearrange(
-                torch.multinomial(cbet_probs.view(-1, choices), num_samples=1),
-                "(NT G) 1 -> NT G",
-                NT=NT,
-            )
-
-        device = get_device_from_parameters(self)
-        indices = (
-            torch.arange(NT, device=device).unsqueeze(1),
-            torch.arange(self.vqvae_model.vqvae_num_layers, device=device).unsqueeze(0),
-            sampled_centers,
-        )
-        # Use advanced indexing to sample the values (Extract the only offsets corresponding to the sampled codes.)
-        sampled_offsets = cbet_offsets[indices]
-        # Then, sum the offsets over the RVQ layers to get a net offset for the bin prediction
-        sampled_offsets = sampled_offsets.sum(dim=1)
-        with torch.no_grad():
-            # Get the centroids (= vectors corresponding to the codes) of each layer to pass it through RVQ decoder
-            return_decoder_input = self.vqvae_model.get_embeddings_from_code(sampled_centers).clone().detach()
-            # pass the centroids through decoder to get actions.
-            decoded_action = self.vqvae_model.get_action_from_latent(return_decoder_input).clone().detach()
-        # reshaped extracted offset to match with decoded centroids
-        sampled_offsets = einops.rearrange(
-            sampled_offsets, "NT (W A) -> NT W A", W=self.config.action_chunk_size
-        )
-        # add offset and decoded centroids
-        predicted_action = decoded_action + sampled_offsets
-        predicted_action = einops.rearrange(
-            predicted_action,
-            "(N T) W A -> N T (W A)",
-            N=N,
-            T=T,
-            W=self.config.action_chunk_size,
-        )
-
-        return {
-            "cbet_logits": cbet_logits,
-            "predicted_action": predicted_action,
-            "sampled_centers": sampled_centers,
-            "decoded_action": decoded_action,
-        }
-
-    def loss_fn(self, pred, target, **kwargs):
+    def tokenize_actions(self, action_chunks: Tensor) -> Tensor:
+        """Tokenize a batch of action chunks with the frozen FAST tokenizer.
+        Args:
+            action_chunks: (B, action_chunk_size, action_dim)
+        Returns:
+            (B, max_action_tokens) long tensor on same device
         """
-        for given ground truth action values (target), and prediction (pred) this function calculates the overall loss.
+        token_ids = self.tokenizer(action_chunks.cpu())  # list of variable-length lists
+        lengths = [len(t) for t in token_ids]
+        logger.debug("FAST token lengths: min=%d max=%d mean=%.1f (max_action_tokens=%d)",
+                    min(lengths), max(lengths), sum(lengths) / len(lengths), self.max_action_tokens)
+        padded = [(t + [-1] * self.max_action_tokens)[: self.max_action_tokens] for t in token_ids]
+        return torch.tensor(padded, dtype=torch.long).to(action_chunks.device)
 
-        predicted_action: predicted action chunk (offset + decoded centroids)
-        sampled_centers: sampled centroids (code of RVQ)
-        decoded_action: decoded action, which is produced by passing sampled_centers through RVQ decoder
-        NT: batch size * T
-        T: number of action query tokens, which are process through same GPT
-        cbet_logits: probability of all codes in each layer
+    def decode_actions(self, token_ids: Tensor) -> Tensor:
+        """Decode FAST token IDs back to continuous actions.
+
+        Uses a greedy prefix search to find the shortest token prefix whose BPE-decoded
+        string has exactly action_chunk_size * action_dim characters. This avoids passing
+        untrained padding positions (which have no gradient during training) to the decoder,
+        which would corrupt the BPE string length and cause shape mismatches.
+
+        Args:
+            token_ids: (B, max_action_tokens) int tensor
+        Returns:
+            (B, action_chunk_size, action_dim) float tensor
         """
-        action_seq = target
-        predicted_action = pred["predicted_action"]
-        sampled_centers = pred["sampled_centers"]
-        decoded_action = pred["decoded_action"]
-        NT = predicted_action.shape[0] * predicted_action.shape[1]
-
-        cbet_logits = pred["cbet_logits"]
-
-        predicted_action = einops.rearrange(
-            predicted_action, "N T (W A) -> (N T) W A", W=self.config.action_chunk_size
+        target_chars = self.action_chunk_size * self.action_dim
+        valid_token_seqs = []
+        for tokens in token_ids.tolist():
+            for n in range(1, len(tokens) + 1):
+                decoded = self.tokenizer.bpe_tokenizer.decode(tokens[:n], skip_special_tokens=True)
+                if len(decoded) == target_chars:
+                    valid_token_seqs.append(tokens[:n])
+                    break
+            else:
+                valid_token_seqs.append(tokens)  # fallback: use all tokens
+        actions = self.tokenizer.decode(
+            valid_token_seqs,
+            time_horizon=self.action_chunk_size,
+            action_dim=self.action_dim,
         )
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions).float()
+        return actions.to(token_ids.device)
 
-        action_seq = einops.rearrange(action_seq, "N T W A -> (N T) W A")
-        # Figure out the loss for the actions.
-        # First, we need to find the closest cluster center for each ground truth action.
-        with torch.no_grad():
-            state_vq, action_bins = self.vqvae_model.get_code(action_seq)  # action_bins: NT, G
+    def loss_fn(self, logits: Tensor, target_actions: Tensor) -> dict:
+        """Cross-entropy over FAST token predictions.
+        Args:
+            logits: (B, T, max_action_tokens, vocab_size)
+            target_actions: (B, T, action_chunk_size, action_dim)
+        """
+        B, T = logits.shape[:2]
+        target_chunks = target_actions.reshape(B * T, self.config.action_chunk_size, -1)
+        target_token_ids = self.tokenize_actions(target_chunks)  # (B*T, max_action_tokens)
 
-        # Now we can compute the loss.
+        logits_flat = logits.reshape(B * T, self.max_action_tokens, self.vocab_size)
+        # Mask out the padding tokens so that they do not contribute to the loss.
+        # This workaround is because FAST uses 0 as a valid token ID, so we use -1 for padding and then
+        # mask it out.
+        mask = (target_token_ids != -1).float()  # (B*T, max_action_tokens)
 
-        # offset loss is L1 distance between the predicted action and ground truth action
-        offset_loss = F.l1_loss(action_seq, predicted_action)
-
-        # calculate primary code prediction loss
-        cbet_loss1 = self._focal_loss_fn(
-            cbet_logits[:, 0, :],
-            action_bins[:, 0],
-        )
-        # calculate secondary code prediction loss
-        cbet_loss2 = self._focal_loss_fn(
-            cbet_logits[:, 1, :],
-            action_bins[:, 1],
-        )
-        # add all the prediction loss
-        cbet_loss = (
-            cbet_loss1 * self.config.primary_code_loss_weight
-            + cbet_loss2 * self.config.secondary_code_loss_weight
-        )
-
-        equal_primary_code_rate = torch.sum((action_bins[:, 0] == sampled_centers[:, 0]).int()) / (NT)
-        equal_secondary_code_rate = torch.sum((action_bins[:, 1] == sampled_centers[:, 1]).int()) / (NT)
-
-        action_mse_error = torch.mean((action_seq - predicted_action) ** 2)
-        vq_action_error = torch.mean(torch.abs(action_seq - decoded_action))
-        offset_action_error = torch.mean(torch.abs(action_seq - predicted_action))
-        action_error_max = torch.max(torch.abs(action_seq - predicted_action))
-
-        loss = cbet_loss + self.config.offset_loss_weight * offset_loss
-
-        loss_dict = {
-            "loss": loss,
-            "classification_loss": cbet_loss.detach().cpu().item(),
-            "offset_loss": offset_loss.detach().cpu().item(),
-            "equal_primary_code_rate": equal_primary_code_rate.detach().cpu().item(),
-            "equal_secondary_code_rate": equal_secondary_code_rate.detach().cpu().item(),
-            "vq_action_error": vq_action_error.detach().cpu().item(),
-            "offset_action_error": offset_action_error.detach().cpu().item(),
-            "action_error_max": action_error_max.detach().cpu().item(),
-            "action_mse_error": action_mse_error.detach().cpu().item(),
-        }
-        return loss_dict
+        loss_per_token = F.cross_entropy(
+            logits_flat.reshape(-1, self.vocab_size),
+            target_token_ids.clamp(min=0).reshape(-1),
+            reduction="none",
+        ).reshape(B * T, self.max_action_tokens)
+        loss = (loss_per_token * mask).sum() / mask.sum().clamp(min=1)
+        return {"loss": loss, "token_ce_loss": loss.detach().item()}
 
 
-class VQBeTRgbEncoder(nn.Module):
+class FASTBeTRgbEncoder(nn.Module):
     """Encode an RGB image into a 1D feature vector.
 
     Includes the ability to normalize and crop the image first.
@@ -653,7 +467,7 @@ class VQBeTRgbEncoder(nn.Module):
     Same with DiffusionRgbEncoder from modeling_diffusion.py
     """
 
-    def __init__(self, config: VQBeTConfig):
+    def __init__(self, config: FASTBeTConfig):
         super().__init__()
         # Set up optional preprocessing.
         if config.crop_shape is not None:
@@ -755,135 +569,7 @@ def _replace_submodules(
     return root_module
 
 
-class VqVae(nn.Module):
-    def __init__(
-        self,
-        config: VQBeTConfig,
-    ):
-        """
-        VQ-VAE is composed of three parts: encoder, vq_layer, and decoder.
-        Encoder and decoder are MLPs consisting of an input, output layer, and hidden layer, respectively.
-        The vq_layer uses residual VQs.
 
-        This class contains functions for training the encoder and decoder along with the residual VQ layer (for training phase 1),
-        as well as functions to help BeT training part in training phase 2.
-        """
-
-        super().__init__()
-        self.config = config
-        # 'discretized' indicates whether the Residual VQ part is trained or not. (After finishing the training, we set discretized=True)
-        self.register_buffer("discretized", torch.tensor(False))
-        self.optimized_steps = 0
-        # we use the fixed number of layers for Residual VQ across all environments.
-        self.vqvae_num_layers = 2
-
-        self.vq_layer = ResidualVQ(
-            dim=config.vqvae_embedding_dim,
-            num_quantizers=self.vqvae_num_layers,
-            codebook_size=config.vqvae_n_embed,
-        )
-
-        self.encoder = MLP(
-            in_channels=self.config.action_feature.shape[0] * self.config.action_chunk_size,
-            hidden_channels=[
-                config.vqvae_enc_hidden_dim,
-                config.vqvae_enc_hidden_dim,
-                config.vqvae_embedding_dim,
-            ],
-        )
-        self.decoder = MLP(
-            in_channels=config.vqvae_embedding_dim,
-            hidden_channels=[
-                config.vqvae_enc_hidden_dim,
-                config.vqvae_enc_hidden_dim,
-                self.config.action_feature.shape[0] * self.config.action_chunk_size,
-            ],
-        )
-
-    def get_embeddings_from_code(self, encoding_indices):
-        # This function gets code indices as inputs, and outputs embedding vectors corresponding to the code indices.
-        with torch.no_grad():
-            z_embed = self.vq_layer.get_codebook_vector_from_indices(encoding_indices)
-            # since the RVQ has multiple layers, it adds the vectors in the axis of layers to provide a vector for that code combination.
-            z_embed = z_embed.sum(dim=0)
-        return z_embed
-
-    def get_action_from_latent(self, latent):
-        # given latent vector, this function outputs the decoded action.
-        output = self.decoder(latent)
-        if self.config.action_chunk_size == 1:
-            return einops.rearrange(output, "N (T A) -> N T A", A=self.config.action_feature.shape[0])
-        else:
-            return einops.rearrange(output, "N (T A) -> N T A", A=self.config.action_feature.shape[0])
-
-    def get_code(self, state):
-        # in phase 2 of VQ-BeT training, we need a `ground truth labels of action data` to calculate the Focal loss for code prediction head. (please refer to section 3.3 in the paper https://huggingface.co/papers/2403.03181)
-        # this function outputs the `GT code` of given action using frozen encoder and quantization layers. (please refer to Figure 2. in the paper https://huggingface.co/papers/2403.03181)
-        state = einops.rearrange(state, "N T A -> N (T A)")
-        with torch.no_grad():
-            state_rep = self.encoder(state)
-            state_rep_shape = state_rep.shape[:-1]
-            state_rep_flat = state_rep.view(state_rep.size(0), -1, state_rep.size(1))
-            state_rep_flat, vq_code, vq_loss_state = self.vq_layer(state_rep_flat)
-            state_vq = state_rep_flat.view(*state_rep_shape, -1)
-            vq_code = vq_code.view(*state_rep_shape, -1)
-            vq_loss_state = torch.sum(vq_loss_state)
-            return state_vq, vq_code
-
-    def vqvae_forward(self, state):
-        # This function passes the given data through Residual VQ with Encoder and Decoder. Please refer to section 3.2 in the paper https://huggingface.co/papers/2403.03181).
-        state = einops.rearrange(state, "N T A -> N (T A)")
-        # We start with passing action (or action chunk) at:t+n through the encoder ϕ.
-        state_rep = self.encoder(state)
-        state_rep_shape = state_rep.shape[:-1]
-        state_rep_flat = state_rep.view(state_rep.size(0), -1, state_rep.size(1))
-        # The resulting latent embedding vector x = ϕ(at:t+n) is then mapped to an embedding vector in the codebook of the RVQ layers by the nearest neighbor look-up.
-        state_rep_flat, vq_code, vq_loss_state = self.vq_layer(state_rep_flat)
-        state_vq = state_rep_flat.view(*state_rep_shape, -1)
-        vq_code = vq_code.view(*state_rep_shape, -1)
-        # since the RVQ has multiple layers, it adds the vectors in the axis of layers to provide a vector for that code combination.
-        vq_loss_state = torch.sum(vq_loss_state)
-        # Then, the discretized vector zq(x) is reconstructed as ψ(zq(x)) by passing through the decoder ψ.
-        dec_out = self.decoder(state_vq)
-        # Calculate L1 reconstruction loss
-        encoder_loss = (state - dec_out).abs().mean()
-        # add encoder reconstruction loss and commitment loss
-        rep_loss = encoder_loss + vq_loss_state * 5
-
-        metric = (
-            encoder_loss.clone().detach(),
-            vq_loss_state.clone().detach(),
-            vq_code,
-            rep_loss.item(),
-        )
-        return rep_loss, metric
-
-
-class FocalLoss(nn.Module):
-    """
-    From https://github.com/notmahi/miniBET/blob/main/behavior_transformer/bet.py
-    """
-
-    def __init__(self, gamma: float = 0, size_average: bool = True):
-        super().__init__()
-        self.gamma = gamma
-        self.size_average = size_average
-
-    def forward(self, input, target):
-        if len(input.shape) == 3:
-            N, T, _ = input.shape
-            logpt = F.log_softmax(input, dim=-1)
-            logpt = logpt.gather(-1, target.view(N, T, 1)).view(N, T)
-        elif len(input.shape) == 2:
-            logpt = F.log_softmax(input, dim=-1)
-            logpt = logpt.gather(-1, target.view(-1, 1)).view(-1)
-        pt = logpt.exp()
-
-        loss = -1 * (1 - pt) ** self.gamma * logpt
-        if self.size_average:
-            return loss.mean()
-        else:
-            return loss.sum()
 
 
 class MLP(torch.nn.Sequential):

@@ -42,6 +42,7 @@ from lerobot.policies.sarm.configuration_sarm import SARMConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.utils import validate_visual_features_consistency
+from lerobot.policies.fastbet.configuration_fastbet import FASTBeTConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
@@ -119,6 +120,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
 
         return MultiTaskDiTPolicy
+    elif name == "fastbet":
+        from lerobot.policies.fastbet.modeling_fastbet import FASTBeTPolicy
+
+        return FASTBeTPolicy
     elif name == "vqbet":
         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
@@ -199,6 +204,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return ACTConfig(**kwargs)
     elif policy_type == "multi_task_dit":
         return MultiTaskDiTConfig(**kwargs)
+    elif policy_type == "fastbet":
+        return FASTBeTConfig(**kwargs)
     elif policy_type == "vqbet":
         return VQBeTConfig(**kwargs)
     elif policy_type == "pi0":
@@ -359,6 +366,14 @@ def make_pre_post_processors(
         )
 
         processors = make_multi_task_dit_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, FASTBeTConfig):
+        from lerobot.policies.fastbet.processor_fastbet import make_fastbet_pre_post_processors
+
+        processors = make_fastbet_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

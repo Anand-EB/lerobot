@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+from lerobot.policies.fastbet.configuration_fastbet import FASTBeTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -33,8 +33,8 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_vqbet_pre_post_processors(
-    config: VQBeTConfig,
+def make_fastbet_pre_post_processors(
+    config: FASTBeTConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],

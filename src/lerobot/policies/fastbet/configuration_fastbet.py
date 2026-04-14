@@ -24,35 +24,24 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import VQBeTSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("vqbet")
+@PreTrainedConfig.register_subclass("fastbet")
 @dataclass
-class VQBeTConfig(PreTrainedConfig):
-    """Configuration class for VQ-BeT.
+class FASTBeTConfig(PreTrainedConfig):
+    """Configuration class for FAST-BeT.
 
-    Defaults are configured for training with PushT providing proprioceptive and single camera observations.
-
-    The parameters you will most likely need to change are the ones which depend on the environment / sensors.
-    Those are: `input_features` and `output_features`.
-
-    Notes on the inputs and outputs:
-        - "observation.state" is required as an input key.
-        - At least one key starting with "observation.image is required as an input.
-        - If there are multiple keys beginning with "observation.image" they are treated as multiple camera
-          views. Right now we only support all images having the same shape.
-        - "action" is required as an output key.
+    Like VQ-BeT but replaces the Residual VQ-VAE action quantizer with a pretrained FAST tokenizer
+    (DCT + BPE), eliminating the two-phase training. The GPT is trained end-to-end to predict
+    FAST token IDs directly via cross-entropy.
 
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
             current step and additional steps going back).
-        n_action_pred_token: Total number of current token and future tokens that VQ-BeT predicts.
+        n_action_pred_token: Total number of current token and future tokens that FASTBeT predicts.
         action_chunk_size: Action chunk size of each action prediction token.
-        input_features: A dictionary defining the PolicyFeature of the input data for the policy. The key represents
-            the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
-        output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
-            the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
-        normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
-            a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        fast_tokenizer_name: HuggingFace repo or local path for the pretrained FAST tokenizer.
+        max_action_tokens: Number of FAST tokens produced per action chunk (tokenizer-dependent).
+        fast_vocab_size: Vocabulary size of the FAST tokenizer (BPE vocab size).
+        vision_backbone: Name of the torchvision resnet backbone.
         crop_shape: (H, W) shape to crop images to as a preprocessing step for the vision backbone. Must fit
             within the image size. If None, no cropping is done.
         crop_is_random: Whether the crop should be random at training time (it's always a center crop in eval
@@ -62,23 +51,13 @@ class VQBeTConfig(PreTrainedConfig):
         use_group_norm: Whether to replace batch normalization with group normalization in the backbone.
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
-        n_vqvae_training_steps: Number of optimization steps for training Residual VQ.
-        vqvae_n_embed: Number of embedding vectors in the RVQ dictionary (each layer).
-        vqvae_embedding_dim: Dimension of each embedding vector in the RVQ dictionary.
-        vqvae_enc_hidden_dim: Size of hidden dimensions of Encoder / Decoder part of Residaul VQ-VAE
-        gpt_block_size: Max block size of minGPT (should be larger than the number of input tokens)
-        gpt_input_dim: Size of output input of GPT. This is also used as the dimension of observation features.
-        gpt_output_dim: Size of output dimension of GPT. This is also used as a input dimension of offset / bin prediction headers.
-        gpt_n_layer: Number of layers of GPT
-        gpt_n_head: Number of headers of GPT
-        gpt_hidden_dim: Size of hidden dimensions of GPT
-        dropout: Dropout rate for GPT
-        offset_loss_weight:  A constant that is multiplied to the offset loss
-        primary_code_loss_weight: A constant that is multiplied to the primary code prediction loss
-        secondary_code_loss_weight: A constant that is multiplied to the secondary code prediction loss
-        bet_softmax_temperature: Sampling temperature of code for rollout with VQ-BeT
-        sequentially_select: Whether select code of primary / secondary as sequentially (pick primary code,
-            and then select secodnary code), or at the same time.
+        gpt_block_size: Max block size of minGPT.
+        gpt_input_dim: GPT input dimension (also used for observation features).
+        gpt_output_dim: GPT output dimension (input to the token prediction head).
+        gpt_n_layer: Number of GPT layers.
+        gpt_n_head: Number of GPT attention heads.
+        gpt_hidden_dim: Size of GPT hidden dimensions.
+        dropout: Dropout rate for GPT.
     """
 
     # Inputs / output structure.
@@ -94,7 +73,11 @@ class VQBeTConfig(PreTrainedConfig):
         }
     )
 
-    # Architecture / modeling.
+    # FAST tokenizer (pretrained, frozen during policy training)
+    fast_tokenizer_name: str = "physical-intelligence/fast"
+    max_action_tokens: int = 8
+    fast_vocab_size: int = 2048
+
     # Vision backbone.
     vision_backbone: str = "resnet18"
     crop_shape: tuple[int, int] | None = (84, 84)
@@ -102,12 +85,8 @@ class VQBeTConfig(PreTrainedConfig):
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
-    # VQ-VAE
-    n_vqvae_training_steps: int = 20000
-    vqvae_n_embed: int = 16
-    vqvae_embedding_dim: int = 256
-    vqvae_enc_hidden_dim: int = 128
-    # VQ-BeT
+
+    # GPT
     gpt_block_size: int = 500
     gpt_input_dim: int = 512
     gpt_output_dim: int = 512
@@ -115,25 +94,16 @@ class VQBeTConfig(PreTrainedConfig):
     gpt_n_head: int = 8
     gpt_hidden_dim: int = 512
     dropout: float = 0.1
-    offset_loss_weight: float = 10000.0
-    primary_code_loss_weight: float = 5.0
-    secondary_code_loss_weight: float = 0.5
-    bet_softmax_temperature: float = 0.1
-    sequentially_select: bool = False
 
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
-    optimizer_vqvae_lr: float = 1e-3
-    optimizer_vqvae_weight_decay: float = 1e-4
     scheduler_warmup_steps: int = 500
 
     def __post_init__(self):
         super().__post_init__()
-
-        """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
@@ -150,12 +120,10 @@ class VQBeTConfig(PreTrainedConfig):
     def get_scheduler_preset(self) -> VQBeTSchedulerConfig:
         return VQBeTSchedulerConfig(
             num_warmup_steps=self.scheduler_warmup_steps,
-            num_vqvae_training_steps=self.n_vqvae_training_steps,
+            num_vqvae_training_steps=0,  # No Action Quantization pretraining phase
         )
 
     def validate_features(self) -> None:
-        # Note: this check was previously performed inside VQBeTRgbEncoder in the form of
-        # assert len(image_keys) == 1
         if not len(self.image_features) == 1:
             raise ValueError("You must provide only one image among the inputs.")
 
@@ -167,8 +135,7 @@ class VQBeTConfig(PreTrainedConfig):
                         f"for `crop_shape` and {image_ft.shape} for "
                         f"`{key}`."
                     )
-
-        # Check that all input images have the same shape.
+        
         first_image_key, first_image_ft = next(iter(self.image_features.items()))
         for key, image_ft in self.image_features.items():
             if image_ft.shape != first_image_ft.shape:
