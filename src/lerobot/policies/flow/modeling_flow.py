@@ -202,9 +202,12 @@ class FlowModel(nn.Module):
         )
 
         # ODE integration from t=0 (noise) to t=1 (data) using Euler solver.
+        # Scale t into [0, num_train_timesteps] to match the range the sinusoidal
+        # positional embedding was designed for.
+        t_scale = self.config.num_train_timesteps
         def velocity_model(x: Tensor, t: Tensor, **kwargs) -> Tensor:
-            # ODESolver passes t as a scalar; expand to (B,) for the UNet.
-            return self.unet(x, t.expand(x.shape[0]), global_cond=global_cond)
+            # ODESolver passes t as a scalar; expand to (B,) and rescale for the UNet.
+            return self.unet(x, t.expand(x.shape[0]) * t_scale, global_cond=global_cond)
 
         solver = ODESolver(velocity_model=velocity_model)
         sample = solver.sample(
@@ -317,8 +320,8 @@ class FlowModel(nn.Module):
         path_sample = self.path.sample(x_0, trajectory, t)
         x_t, ut = path_sample.x_t, path_sample.dx_t
 
-        # Predict the vector field.
-        pred = self.unet(x_t, t, global_cond=global_cond)
+        # Predict the vector field. Scale t to match the sinusoidal embedding range.
+        pred = self.unet(x_t, t * self.config.num_train_timesteps, global_cond=global_cond)
 
         loss = F.mse_loss(pred, ut, reduction="none")
 
