@@ -30,6 +30,7 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.policies.flowdit.configuration_flowdit import DiTFlowConfig
 from lerobot.policies.flow.configuration_flow import FlowConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
@@ -93,7 +94,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
-            "multi_task_dit", "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x".
+            "multi_task_dit", "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x", "flowdit".
     Returns:
         The policy class corresponding to the given name.
 
@@ -112,6 +113,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.flow.modeling_flow import FlowPolicy
 
         return FlowPolicy
+    elif name == "ditflow":
+        from lerobot.policies.flowdit.modeling_flowdit import DiTFlowPolicy
+
+        return DiTFlowPolicy
     elif name == "act":
         from lerobot.policies.act.modeling_act import ACTPolicy
 
@@ -200,6 +205,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return DiffusionConfig(**kwargs)
     elif policy_type == "flow":
         return FlowConfig(**kwargs)
+    elif policy_type == "ditflow":
+        return DiTFlowConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
     elif policy_type == "multi_task_dit":
@@ -348,6 +355,14 @@ def make_pre_post_processors(
         from lerobot.policies.flow.processor_flow import make_flow_pre_post_processors
 
         processors = make_flow_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, DiTFlowConfig):
+        from lerobot.policies.flowdit.processor_flowdit import make_ditflow_pre_post_processors
+
+        processors = make_ditflow_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
